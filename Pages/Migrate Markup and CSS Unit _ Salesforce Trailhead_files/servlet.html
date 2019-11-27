@@ -1,0 +1,463 @@
+
+<!-- saved from url=(0122)https://trailblazer.me/servlet/servlet.loginwidgetcontroller?type=javascript_xauth&brand=trailhead&min=false&cacheMaxAge=0 -->
+<html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"><script>/*
+    Copyright 2010 Meebo Inc.
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+        http://www.apache.org/licenses/LICENSE-2.0
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+*/
+
+/**
+    History
+    2010-04-27
+    Overcommenting
+    -jianshen
+    2010-04-16
+    Added in checks for disabled and blocked tokens
+    -jianshen
+
+    2010-03-26
+    First version of xauth server code
+    -Jian Shen, Meebo
+**/
+
+(function() {
+    // Reference shortcut so minifier can save on characters
+    var win = window;
+
+    // We're the top window, don't do anything
+    if(win.top === win) {
+        return;
+    }
+
+    // unsupported browser
+    if (!win.postMessage || !storageAvailable('localStorage') || !win.JSON) {
+        return;
+    }
+    
+    // Cleaner way to determine if local storage is available
+    function storageAvailable(type) {
+    	try {
+    		var storage = window[type],
+    		    x = '__storage_test__';
+    		storage.setItem(x,x);
+    		storage.removeItem(x);
+    		return true;
+    	}catch(e){
+    		return e instanceof DOMException && (
+    	            // everything except Firefox
+    	            e.code === 22 ||
+    	            // Firefox
+    	            e.code === 1014 ||
+    	            // test name field too, because code might not be present
+    	            // everything except Firefox
+    	            e.name === 'QuotaExceededError' ||
+    	            // Firefox
+    	            e.name === 'NS_ERROR_DOM_QUOTA_REACHED') &&
+    	            // acknowledge QuotaExceededError only if there's something already stored
+    	            storage.length !== 0;
+    	}
+    }
+
+    // Reference shortcut so minifier can save on characters
+    var storage = win.localStorage;
+
+    // To allow for session based XAuth tokens (tokens that expire immediately
+    // after the browser session ends), we piggy back off of traditional
+    // browser cookies. This cookie is set the first time XAuth is loaded
+    // and any session based XAuth tokens will be marked with this unique
+    // key. The next time the browser is started, a new unique key is created
+    // thereby invalidating any previous session based XAuth tokens
+    var currentSession = null;
+    var match = document.cookie.match(/(?:^|;)\s*widgetSession=(\d+)(?:;|$)/);
+    if (match && match.length) {
+        currentSession = match[1];
+    }
+    if(!currentSession) {
+        currentSession = new Date().getTime().toString();
+        document.cookie = ('widgetSession=' + currentSession + "; ");
+    }
+
+    // Set up the API
+    var XAuthApi = {
+        /**
+        Request object will look like:
+        {
+            cmd:'sfdcxauth::extend',
+            id:1,
+            identityServiceResponse:YOUR_TOKEN,
+            allowedDomains: [ Array of domain strings you allow ],
+            expire: JS date timestamp number,
+            widgetSession: true or false boolean indicating if this token is browser session based
+        }
+        **/
+
+        'sfdcxauth::extend': function(originHostname, requestObj) {
+
+            SFIDWidgetXAuthLog("entering xauth extend function");
+
+            if( !SFIDWidgetXAuthValidateRequestObj(requestObj, originHostname)) {
+                return null;
+            }
+
+            requestObj.uid = requestObj.uid.substring(0, 15);
+            requestObj.oid = requestObj.oid.substring(0, 15);
+            var storageKey = requestObj.oid + requestObj.uid;
+
+            var loaded = storage.getItem(storageKey);
+            var store = loaded ? JSON.parse(loaded) : { // Deposit box contents
+                identity: requestObj.identity,
+                expire: requestObj.expire,
+                active: requestObj.active,
+                lastused: new Date().getTime(),
+                mydomain: requestObj.mydomain,
+                community: requestObj.community,
+                activeonly: requestObj.activeonly,
+                retainhint: requestObj.retainhint,
+                allowedDomains: requestObj.allowedDomains,
+                identityServiceResponse: requestObj.identityServiceResponse
+            };
+
+            if(loaded) { //if pre-existing storage is there, only update widget specific values
+                store.allowedDomains = requestObj.allowedDomains;
+                store.identityServiceResponse = requestObj.identityServiceResponse;
+            }
+
+            // Check if this is requesting to be a session based store
+            if(requestObj.widgetSession === true) {
+                store.widgetSession = currentSession; // We check this on retrieve
+            }
+
+            // Save
+            storage.setItem(storageKey, JSON.stringify(store));
+
+            // Send Response Object
+            return {
+                cmd: requestObj.cmd,
+                id: requestObj.id
+            };
+        },
+
+        /**
+        Request object will look like:
+        {
+            cmd:'sfdcxauth::retrieve',
+            id:1,
+            retrieve: [ Array of domains you are interested in ]
+        }
+        **/
+        'sfdcxauth::retrieve': function(originHostname, requestObj) {
+
+            SFIDWidgetXAuthLog("entering xauth retrieve function");
+
+            var results = SFIDWidgetXAuthGetValidIdentityServiceResponses(requestObj, originHostname);
+            var onlyOneResult = Object.keys(results).length === 1;
+            if( onlyOneResult === false ) {
+                results = {};
+            }
+            SFIDWidgetXAuthRemoveMultipleValidIdentityServiceMatches(results);
+
+            return {
+                cmd: requestObj.cmd,
+                id: requestObj.id,
+                identityServiceResponses: results
+            };
+        },
+
+        /**
+        Request object will look like:
+        {
+            cmd:'sfdcxauth::alive',
+            id:1,
+            retrieve: [ Array of domains you are interested in ]
+        }
+        **/
+        'sfdcxauth::alive': function(originHostname, requestObj) {
+
+            SFIDWidgetXAuthLogAlive(requestObj.id, "entering xauth alive function");
+
+            var results = SFIDWidgetXAuthGetValidIdentityServiceResponses(requestObj, originHostname);
+            var alive = Object.keys(results).length === 1;
+            SFIDWidgetXAuthRemoveMultipleValidIdentityServiceMatches(results);
+
+            return {
+                cmd: requestObj.cmd,
+                id: requestObj.id,
+                alive: alive
+            };
+        },
+
+        'sfdcxauth::expire': function(originHostname, requestObj) {
+
+            SFIDWidgetXAuthLog("entering xauth expire function");
+
+            storage.removeItem(requestObj.storageKey);
+
+            return {
+                cmd: requestObj.cmd,
+                id: requestObj.id
+            };
+        }
+    };
+
+    // Do validation on requestObj
+    function SFIDWidgetXAuthValidateRequestObj(requestObj, originHostname) {
+
+        if(!requestObj.uid || ( !SFIDWidgetXAuthStartsWith(requestObj.uid,"005")) || (requestObj.uid.length < 15) ) {
+            SFIDWidgetXAuthLogError(requestObj, 'No uid', originHostname);
+            return false;
+        }
+
+        if(!requestObj.oid || ( !SFIDWidgetXAuthStartsWith(requestObj.oid,"00D")) || (requestObj.oid.length < 15) ) {
+            SFIDWidgetXAuthLogError(requestObj, 'No oid', originHostname);
+            return false;
+        }
+
+        // Validate and clean token
+        if(!requestObj.identity) {
+            SFIDWidgetXAuthLogError(requestObj, 'No identity', originHostname);
+            return false;
+        }
+
+        // Validate the instance URL
+        if(!requestObj.identity.instance) {
+            SFIDWidgetXAuthLogError(requestObj, 'No instance URL', originHostname);
+            return false;
+        } else {
+            var instUrl = requestObj.identity.instance;
+            if(instUrl && instUrl.length > 6) {
+                var protocol = instUrl.substring(0, 6);
+                if(!(protocol === 'http:/' || protocol === 'https:')) {
+                    SFIDWidgetXAuthLogError(requestObj, 'Bad instance URL', originHostname);
+                    return false;
+                }
+            } else {
+                SFIDWidgetXAuthLogError(requestObj, 'Short instance URL', originHostname);
+                return false;
+            }
+        }
+
+        // Validate identityServiceResponse
+        if(!requestObj.identityServiceResponse) {
+            SFIDWidgetXAuthLogError(requestObj, 'Invalid identityServiceResponse', originHostname);
+            return false;
+        }
+
+        // Validate expiry date
+        if((typeof requestObj.expire !== "number") || (Math.floor(requestObj.expire) !== requestObj.expire)) {
+            SFIDWidgetXAuthLogError(requestObj, 'Invalid Expiration', originHostname);
+            return false;
+        }
+
+        // Validate allowedDomains list
+        if(!requestObj.allowedDomains || !requestObj.allowedDomains.length) {
+            SFIDWidgetXAuthLogError(requestObj, 'No allowedDomains List Specified', originHostname);
+            return false;
+        }
+
+        return true;
+    }
+
+    //remove multiple matches
+    function SFIDWidgetXAuthRemoveMultipleValidIdentityServiceMatches(results) {
+        if(Object.keys(results).length <= 1) {
+            return;
+        }
+        for(var result in results) {
+            storage.removeItem(result);
+        }
+    }
+
+    //return any valid identityServiceResponses for originHostname
+    function SFIDWidgetXAuthGetValidIdentityServiceResponses(requestObj, originHostname) {
+        var results = {};
+        if( requestObj.retrieve && requestObj.retrieve.length) {
+            // Iterate through the list of requested keys
+            for(var i = 0; i<requestObj.retrieve.length; i = i + 1) {
+                var requestedKey = requestObj.retrieve[i];
+                var loaded = storage.getItem(requestedKey);
+                var store = loaded ? JSON.parse(loaded) : null;
+                SFIDWidgetXAuthCheckStorage(requestedKey, store, originHostname, results);
+            }
+        } else { //get all identities
+            for (var j = storage.length-1; j >=0; j = j - 1){
+                var storageKey = storage.key(j);
+                // 00D is org id and 005 is user id
+                if (storageKey.substring(0, 3) === "00D" && storageKey.substring(15, 18) === "005") {
+                    //its an identity
+                    var storedValue = storage.getItem(storageKey);
+                    var parsedStoredValue = storedValue ? JSON.parse(storedValue) : null;
+                    SFIDWidgetXAuthCheckStorage(storageKey, parsedStoredValue, originHostname, results);
+                }
+            }
+        }
+
+        return results;
+    }
+
+    // validates storage
+    function SFIDWidgetXAuthCheckStorage(storageKey, storageValue, originHostname, results) {
+        // Check if it exists in storage and if it's not blocked by the user
+        if(storageValue && !storageValue.block) {
+
+            // Check if requesting host is in allowedDomains list
+            var allowed = SFIDWidgetXAuthRequestingHostInAllowedDomainsList(storageValue, originHostname);
+
+            if(allowed && storageValue.identityServiceResponse) {
+                if(SFIDWidgetXAuthCheckIdentityServiceResponseSessionExpiry(storageKey, storageValue)) {
+                    return;
+                }
+
+                // identityServiceResponse is still valid, add it to the results
+                results[storageKey] = {'identityServiceResponse':storageValue.identityServiceResponse};
+            }
+        }
+    }
+
+    // Check if identityServiceResponse is session based and whether or not it was set in the current browser session
+    function SFIDWidgetXAuthCheckIdentityServiceResponseSessionExpiry(storageKey, store) {
+
+        if(store.widgetSession && store.widgetSession !== currentSession) {
+            storage.removeItem(storageKey);
+            return true;
+        }
+
+        return false;
+    }
+
+    //check if requester is allowed to view storage contents based on domain
+    function SFIDWidgetXAuthRequestingHostInAllowedDomainsList(store, originHostname) {
+        if(!store.allowedDomains){
+            return false;
+        }
+
+        for(var j = 0; j < store.allowedDomains.length; j = j + 1) {
+            var thisAllowedDomains = store.allowedDomains[j];
+            if(thisAllowedDomains === originHostname ) {
+                return true;
+            }
+
+            if (thisAllowedDomains.indexOf('*.') === 0) {
+                var thisDomain = thisAllowedDomains.substring(2, thisAllowedDomains.length);
+                if( SFIDWidgetXAuthEndsWith(originHostname, thisDomain)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // logging
+    function SFIDWidgetXAuthLog(message) {
+        if(win.console && win.console.log) {
+            win.console.log(message);
+        }
+    }
+
+    // xauth alive logging -- once every 5 mins
+    function SFIDWidgetXAuthLogAlive(requestObjId, message) {
+        if((requestObjId) && requestObjId % 100 === 0) {
+            SFIDWidgetXAuthLog(message);
+        }
+    }
+
+    /**
+        help with debugging issues
+        We can eventually toggle this using a debug.xauth.org store
+    **/
+    function SFIDWidgetXAuthLogError(requestObj, message, originHostname) {
+        if(!requestObj || (typeof requestObj.id != 'number') ) {
+            return;
+        }
+        if(win.console && win.console.log) {
+            win.console.log(requestObj.cmd + ' Error: ' + message);
+        }
+    }
+
+    function SFIDWidgetXAuthEndsWith(str, suffix) {
+        return str.indexOf(suffix, str.length - suffix.length) !== -1;
+    }
+    
+    function SFIDWidgetXAuthStartsWith(str, searchString, position) {
+        if (!String.prototype.startsWith) { 
+            position = position || 0;
+            return str.indexOf(searchString, position) === position;
+        } else {
+            return str.startsWith(searchString);
+        }
+    }
+
+    // Make sure response message has an id and send it on to parent window
+    // origin is the URI of the window we're postMessaging to
+    function SFIDWidgetXAuthSendResponse(responseObj, origin) {
+        if(!responseObj || (typeof responseObj.id != 'number') ) {
+            return;
+        }
+        win.parent.postMessage(JSON.stringify(responseObj), origin);
+    }
+
+    // Dynamically called since the user can open up xauth.org and disable
+    // the entire thing while another browser tab has an xauth.org iframe open
+    function SFIDWidgetXAuthCheckDisabled() {
+        return (storage.getItem('disabled.xauth.org') === '1');
+    }
+
+    // Listener for window message events, receives messages from parent window
+    function SFIDWidgetXAuthOnMessage(event) {
+        // event.origin will always be of the format scheme://hostname:port
+        // http://www.whatwg.org/specs/web-apps/current-work/multipage/comms.html#dom-messageevent-origin
+
+        var requestObj;
+
+        if(typeof event.data === "string") {
+            requestObj = JSON.parse(event.data);
+        }
+
+        if(!requestObj || !requestObj.cmd || (typeof requestObj.cmd !== "string")) {
+            return;
+        }
+
+        var originHostname = event.origin.split('://')[1].split('/')[0];
+        /**
+        message generally looks like
+        {
+            cmd: xauth::command_name,
+            id: request_id,
+            other parameters
+        }
+        **/
+
+        if(!requestObj || typeof requestObj != 'object'
+            || !requestObj.cmd || requestObj.id === undefined
+            || SFIDWidgetXAuthCheckDisabled()) {
+            // A post message we don't understand
+            return;
+        }
+
+        if('sfdcxauth::alive' === requestObj.cmd) {
+            SFIDWidgetXAuthLogAlive(requestObj.id, event.data);
+        }
+
+        if(XAuthApi[requestObj.cmd]) {
+            // A command we understand, send the response on back to the posting window
+            SFIDWidgetXAuthSendResponse(XAuthApi[requestObj.cmd](originHostname, requestObj), event.origin);
+        }
+    }
+
+    // Setup postMessage event listeners
+    if (win.addEventListener) {
+        win.addEventListener('message', SFIDWidgetXAuthOnMessage, false);
+    } else if(win.attachEvent) {
+        win.attachEvent('onmessage', SFIDWidgetXAuthOnMessage);
+    }
+
+    // Finally, tell the parent window we're ready.
+    win.parent.postMessage(JSON.stringify({cmd: 'sfdcxauth::ready'}), "*");
+
+})();</script></head><body></body></html>
